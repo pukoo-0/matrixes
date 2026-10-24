@@ -6,23 +6,24 @@ from fractions import Fraction
 import numpy as np
 import streamlit as st
 import streamlit.components.v1 as components
-from pymatgen.core import Molecule
-from pymatgen.symmetry.analyzer import PointGroupAnalyzer
+
+try:
+    from pymatgen.core import Molecule
+    from pymatgen.symmetry.analyzer import PointGroupAnalyzer
+    HAS_PMG = True
+except ImportError:
+    HAS_PMG = False
 
 # wide layout
-st.set_page_config(
-    page_title="Molecular Space & Matrix Visualizer",
-    page_icon="📐",
-    layout="wide",
-)
+st.set_page_config(page_title="Matrix transformation", page_icon="⚛️", layout="wide")
 
-# clean styling matching your symmetry app
+# css matching the point group app
 st.markdown("""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap');
 
 .stApp {background:#ffffff;}
-.block-container {padding-top:2.4rem; padding-bottom:3rem; max-width:1360px;}
+.block-container {padding-top:2.4rem; padding-bottom:3rem; max-width:1320px;}
 .stApp p, .stApp label, .stApp h1, .stApp h2, .stApp h3, .ui, .ui * {font-family:'Inter', system-ui, sans-serif;}
 footer {visibility:hidden;}
 header[data-testid="stHeader"] {background:transparent;}
@@ -42,6 +43,145 @@ header[data-testid="stHeader"] {background:transparent;}
 """, unsafe_allow_html=True)
 
 PLANE_ORDER = ["σh", "σv", "σv'", "σd", "σ"]
+ATOMIC_MASS = {
+    "H": 1.008, "He": 4.0026, "Li": 6.94, "Be": 9.0122, "B": 10.81, "C": 12.011,
+    "N": 14.007, "O": 15.999, "F": 18.998, "Ne": 20.18, "Na": 22.99, "Mg": 24.305,
+    "Al": 26.982, "Si": 28.085, "P": 30.974, "S": 32.06, "Cl": 35.45, "Ar": 39.948,
+    "K": 39.098, "Ca": 40.078, "Ti": 47.867, "Cr": 51.996, "Mn": 54.938, "Fe": 55.845,
+    "Co": 58.933, "Ni": 58.693, "Cu": 63.546, "Zn": 65.38, "Br": 79.904, "Ag": 107.87,
+    "I": 126.90, "Pt": 195.08, "Au": 196.97,
+}
+
+
+def parse_xyz_fallback(xyz_str):
+    lines = [l.strip() for l in xyz_str.strip().splitlines() if l.strip()]
+    if not lines:
+        raise ValueError("Empty XYZ file")
+    try:
+        n_atoms = int(lines[0].split()[0])
+        atom_lines = lines[2:2 + n_atoms]
+        if len(atom_lines) < n_atoms and len(lines) >= 1 + n_atoms:
+            atom_lines = lines[1:1 + n_atoms]
+    except ValueError:
+        atom_lines = lines
+
+    species, coords = [], []
+    for line in atom_lines:
+        parts = line.split()
+        if len(parts) < 4:
+            continue
+        species.append(parts[0].capitalize())
+        coords.append([float(parts[1]), float(parts[2]), float(parts[3])])
+    if not species:
+        raise ValueError("No valid atom coordinates found")
+
+    coords = np.array(coords, dtype=float)
+    masses = np.array([ATOMIC_MASS.get(el, 12.0) for el in species])
+    com = np.average(coords, axis=0, weights=masses)
+    centered = coords - com
+
+    out_lines = [str(len(species)), "Centered"]
+    for el, (x, y, z) in zip(species, centered):
+        out_lines.append(f"{el:2s} {x:14.8f} {y:14.8f} {z:14.8f}")
+    return species, centered, "\n".join(out_lines)
+
+
+def is_sym_op(R, species, coords, tol):
+    transformed = coords @ R.T
+    for el in set(species):
+        idx = [i for i, s in enumerate(species) if s == el]
+        P = coords[idx]
+        Q = transformed[idx]
+        diff = Q[:, None, :] - P[None, :, :]
+        dist = np.sqrt(np.min(np.sum(diff * diff, axis=-1), axis=1))
+        if np.max(dist) > tol:
+            return False
+    return True
+
+
+def fallback_symmetry(species, coords, tol):
+    _, svals, _ = np.linalg.svd(coords)
+    if len(coords) <= 2 or svals[1] < 1e-2:
+        has_i = is_sym_op(-np.eye(3), species, coords, tol)
+        return ("D*h" if has_i else "C*v"), []
+
+    masses = np.array([ATOMIC_MASS.get(el, 12.0) for el in species])
+    r2 = np.sum(coords ** 2, axis=1)
+    I_tensor = np.sum(
+        masses[:, None, None] * (r2[:, None, None] * np.eye(3) - coords[:, :, None] * coords[:, None, :]),
+        axis=0
+    )
+    _, evecs = np.linalg.eigh(I_tensor)
+
+    cand_dirs = [evecs[:, 0], evecs[:, 1], evecs[:, 2]]
+    norms = np.linalg.norm(coords, axis=1)
+    for p in coords[norms > 0.1][:36]:
+        cand_dirs.append(p / np.linalg.norm(p))
+
+    for el in set(species):
+        idx = [i for i, s in enumerate(species) if s == el]
+        sub_c = coords[idx]
+        sub_r = np.round(np.linalg.norm(sub_c, axis=1), 1)
+        for rad in np.unique(sub_r):
+            if rad < 0.1:
+                continue
+            shell = sub_c[sub_r == rad][:24]
+            for i in range(len(shell)):
+                for j in range(i + 1, len(shell)):
+                    for v in (shell[i] + shell[j], shell[i] - shell[j]):
+                        if np.linalg.norm(v) > 0.1:
+                            cand_dirs.append(v / np.linalg.norm(v))
+
+    unique_dirs = []
+    for u in cand_dirs:
+        u = unit(u)
+        if not any(abs(np.dot(u, v)) > 0.992 for v in unique_dirs):
+            unique_dirs.append(u)
+
+    valid_ops = [np.eye(3)]
+    if is_sym_op(-np.eye(3), species, coords, tol):
+        valid_ops.append(-np.eye(3))
+
+    for u in unique_dirs:
+        R_ref = np.eye(3) - 2.0 * np.outer(u, u)
+        if is_sym_op(R_ref, species, coords, tol):
+            if not any(np.allclose(R_ref, M, atol=5e-2) for M in valid_ops):
+                valid_ops.append(R_ref)
+        for n in (2, 3, 4, 5, 6, 8, 10, 12):
+            for k in range(1, n):
+                ang = 2.0 * np.pi * k / n
+                R_rot = rodrigues(u, ang)
+                if is_sym_op(R_rot, species, coords, tol):
+                    if not any(np.allclose(R_rot, M, atol=5e-2) for M in valid_ops):
+                        valid_ops.append(R_rot)
+                R_imp = R_rot @ R_ref
+                if is_sym_op(R_imp, species, coords, tol):
+                    if not any(np.allclose(R_imp, M, atol=5e-2) for M in valid_ops):
+                        valid_ops.append(R_imp)
+
+    axes = get_axes(valid_ops, "C1", coords, tol)
+    planes = get_planes(valid_ops)
+    has_i = any(np.allclose(M, -np.eye(3), atol=5e-2) for M in valid_ops)
+    if not axes:
+        pg = "Cs" if planes else ("Ci" if has_i else "C1")
+    else:
+        nmax = max(a["n"] for a in axes)
+        n_top = sum(1 for a in axes if a["n"] == nmax)
+        if nmax == 5 and n_top >= 6:
+            pg = "Ih" if planes else "I"
+        elif nmax == 4 and n_top == 3:
+            pg = "Oh" if planes else "O"
+        elif nmax == 3 and sum(1 for a in axes if a["n"] == 3) == 4:
+            pg = "Th" if has_i else ("Td" if planes else "T")
+        else:
+            main = [a["u"] for a in axes if a["n"] == nmax][0]
+            perp_c2 = sum(1 for a in axes if a["n"] == 2 and abs(np.dot(a["u"], main)) < 0.15)
+            has_sh = any(abs(np.dot(n, main)) > 0.98 for n in planes)
+            if perp_c2 >= nmax:
+                pg = f"D{nmax}h" if has_sh else (f"D{nmax}d" if planes else f"D{nmax}")
+            else:
+                pg = f"C{nmax}h" if has_sh else (f"C{nmax}v" if planes else f"C{nmax}")
+    return pg, valid_ops
 
 
 def sub(s):
@@ -229,7 +369,6 @@ def label_planes(normals, pg, axes, coords, tol):
 
 
 def build_linear_sym_ops(pg, coords):
-    """Generate representative symmetry matrices for linear molecules (C*v and D*h)."""
     main = unit(np.linalg.svd(coords - coords.mean(0))[2][0])
     a = np.array([1.0, 0.0, 0.0]) if abs(main[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
     p1 = unit(a - np.dot(a, main) * main)
@@ -239,50 +378,22 @@ def build_linear_sym_ops(pg, coords):
         return np.where(np.abs(M) < 1e-6, 0.0, np.round(M, 4)).tolist()
 
     ops = [
-        {
-            "kind": "C", "u": main.tolist(), "a": float(np.pi / 2),
-            "name": "C<sub>∞</sub> (90°)", "group": "Proper Rotations (det = +1)",
-            "R": clean(rodrigues(main, np.pi / 2)),
-            "desc": "Rotate 3D space by 90° around the C∞ molecular axis (det = +1)"
-        },
-        {
-            "kind": "C", "u": main.tolist(), "a": float(np.pi),
-            "name": "C<sub>∞</sub> (180°)", "group": "Proper Rotations (det = +1)",
-            "R": clean(rodrigues(main, np.pi)),
-            "desc": "Rotate 3D space by 180° around the C∞ molecular axis (det = +1)"
-        },
-        {
-            "kind": "s", "n": p1.tolist(),
-            "name": "σ<sub>v</sub> 1", "group": "Reflections (det = -1)",
-            "R": clean(np.eye(3) - 2.0 * np.outer(p1, p1)),
-            "desc": "Reflect 3D space across vertical plane σv 1 containing the molecular axis (det = -1)"
-        },
-        {
-            "kind": "s", "n": p2.tolist(),
-            "name": "σ<sub>v</sub> 2", "group": "Reflections (det = -1)",
-            "R": clean(np.eye(3) - 2.0 * np.outer(p2, p2)),
-            "desc": "Reflect 3D space across vertical plane σv 2 containing the molecular axis (det = -1)"
-        },
+        {"kind": "C", "u": main.tolist(), "a": float(np.pi / 2), "name": "C<sub>∞</sub> (90°)",
+         "group": "Rotations", "R": clean(rodrigues(main, np.pi / 2))},
+        {"kind": "C", "u": main.tolist(), "a": float(np.pi), "name": "C<sub>∞</sub> (180°)",
+         "group": "Rotations", "R": clean(rodrigues(main, np.pi))},
+        {"kind": "s", "n": p1.tolist(), "name": "σ<sub>v</sub> 1",
+         "group": "Reflections", "R": clean(np.eye(3) - 2.0 * np.outer(p1, p1))},
+        {"kind": "s", "n": p2.tolist(), "name": "σ<sub>v</sub> 2",
+         "group": "Reflections", "R": clean(np.eye(3) - 2.0 * np.outer(p2, p2))},
     ]
     if pg == "D*h":
         ops.extend([
-            {
-                "kind": "C", "u": p1.tolist(), "a": float(np.pi),
-                "name": "C<sub>2</sub>'", "group": "Proper Rotations (det = +1)",
-                "R": clean(rodrigues(p1, np.pi)),
-                "desc": "Rotate 3D space by 180° around a perpendicular C2 axis (det = +1)"
-            },
-            {
-                "kind": "i", "name": "i (Inversion)", "group": "Inversion (det = -1)",
-                "R": clean(-np.eye(3)),
-                "desc": "Invert all of 3D space straight through the origin (R = -I, det = -1)"
-            },
-            {
-                "kind": "s", "n": main.tolist(),
-                "name": "σ<sub>h</sub>", "group": "Reflections (det = -1)",
-                "R": clean(np.eye(3) - 2.0 * np.outer(main, main)),
-                "desc": "Reflect 3D space across the horizontal mirror plane σh perpendicular to C∞ (det = -1)"
-            },
+            {"kind": "C", "u": p1.tolist(), "a": float(np.pi), "name": "C<sub>2</sub>'",
+             "group": "Rotations", "R": clean(rodrigues(p1, np.pi))},
+            {"kind": "i", "name": "i", "group": "Inversion", "R": clean(-np.eye(3))},
+            {"kind": "s", "n": main.tolist(), "name": "σ<sub>h</sub>",
+             "group": "Reflections", "R": clean(np.eye(3) - 2.0 * np.outer(main, main))},
         ])
     return ops
 
@@ -300,17 +411,15 @@ def build_sym_ops(matrices, axes, planes):
             k = int(np.argmax([abs(np.dot(p["n"], n)) for p in planes]))
             p = planes[k]
             out.append({
-                "kind": "s", "n": p["n"].tolist(), "name": p["name"], "group": "Reflections (det = -1)",
-                "R": R_clean, "sort": (3, k, 0, 0, 0),
-                "desc": f"Reflection across {p['name']}: space squishes flat onto the mirror plane (det = 0 at t=0.5) and flips inside-out (det = -1)"
+                "kind": "s", "n": p["n"].tolist(), "name": p["name"], "group": "Reflections",
+                "R": R_clean, "sort": (3, k, 0, 0, 0)
             })
             continue
 
         if det < 0 and abs(tr + 3.0) < 0.08:
             out.append({
-                "kind": "i", "name": "i (Inversion)", "group": "Inversion (det = -1)",
-                "R": R_clean, "sort": (1, 0, 0, 0, 0),
-                "desc": "Inversion through origin (R = -I): î, ĵ, k̂ and all grid lines pass through (0,0,0) and invert to -î, -ĵ, -k̂"
+                "kind": "i", "name": "i", "group": "Inversion",
+                "R": R_clean, "sort": (1, 0, 0, 0, 0)
             })
             continue
 
@@ -354,17 +463,9 @@ def build_sym_ops(matrices, axes, planes):
             elif num:
                 name += f" (axis{num})"
 
-        deg = round(np.degrees(a))
-        if letter == "C":
-            ax_str = sub(axis_name(axes[j]["n"], axes[j].get("subtype"))) if j >= 0 else ""
-            desc = f"Proper rotation by {deg}° about {ax_str}: the 3D grid rotates rigidly (det = +1) and every atom lands on an equivalent atom"
-        else:
-            desc = f"Improper rotation by {deg}° + reflection: space rotates then flips orientation across the perpendicular plane (det = -1)"
-
         out.append({
-            "kind": letter, "u": u.tolist(), "a": a, "name": name,
-            "R": R_clean, "desc": desc,
-            "group": "Proper Rotations (det = +1)" if letter == "C" else "Improper Rotations (det = -1)",
+            "kind": letter, "u": u.tolist(), "a": a, "name": name, "R": R_clean,
+            "group": "Rotations" if letter == "C" else "Improper rotations",
             "sort": (0 if letter == "C" else 2, -n, len(primes), int(j >= 0 and axes[j]["n"] != n), j + k * 0.01)
         })
 
@@ -374,28 +475,23 @@ def build_sym_ops(matrices, axes, planes):
     return out
 
 
-def atom_labels(mol):
+def atom_labels_from_species(species):
     count, labs = Counter(), []
-    for s in mol:
-        el = str(s.specie)
+    for el in species:
         count[el] += 1
         labs.append(f"{el}{count[el]}")
     return labs
 
 
-def render_app(cmol, pg, sym_ops, mol_name, order_str):
-    xyz = cmol.to(fmt="xyz")
-    coords = cmol.cart_coords
+def render_app(xyz, coords, species, pg, sym_ops, order_str):
     size = float(max(np.linalg.norm(coords, axis=1).max(), 1.2))
-
     atoms = [
-        {"p": c.tolist(), "el": str(s.specie), "lab": lab}
-        for c, s, lab in zip(coords, cmol, atom_labels(cmol))
+        {"p": c.tolist(), "el": el, "lab": lab}
+        for c, el, lab in zip(coords, species, atom_labels_from_species(species))
     ]
 
     data = {
         "xyz": xyz,
-        "name": mol_name,
         "pg": sub(pg),
         "orderStr": order_str,
         "atoms": atoms,
@@ -410,123 +506,120 @@ def render_app(cmol, pg, sym_ops, mol_name, order_str):
 * {box-sizing:border-box; font-family:'Inter', system-ui, sans-serif;}
 body {margin:0; background:#fff; color:#111827;}
 
-.layout {display:grid; grid-template-columns:1fr 420px; gap:16px; align-items:start;}
-@media (max-width: 1050px) { .layout {grid-template-columns:1fr;} }
+.layout {display:grid; grid-template-columns:1fr 380px; gap:20px; align-items:start;}
+@media (max-width: 1024px) { .layout {grid-template-columns:1fr;} }
 
 .card {background:#fff; border:1px solid #eceef1; border-radius:14px; overflow:hidden;
        box-shadow:0 1px 2px rgba(16,24,40,.04); margin-bottom:12px;}
-.pad {padding:15px 17px;}
+.pad {padding:18px 20px;}
+
+.cap {font-size:13px; font-weight:500; color:#6b7280; margin:0;}
+.pg-row {display:flex; align-items:baseline; justify-content:space-between;}
+.pg-symbol {font-family:Georgia, 'Times New Roman', serif; font-size:48px; line-height:1.05; margin:4px 0 0 0;}
+.pg-order {font-size:13px; color:#6b7280;}
 
 .bar {display:flex; flex-wrap:wrap; gap:8px; align-items:center; justify-content:space-between;
       padding:10px 12px; border-bottom:1px solid #f1f2f4; background:#fff;}
 .seg {display:inline-flex; background:#f3f4f6; border-radius:9px; padding:3px;}
-.seg button {border:0; background:transparent; padding:5px 11px; font-size:12px; border-radius:7px;
-             cursor:pointer; color:#4b5563; font-weight:500;}
-.seg button.on {background:#fff; color:#111827; box-shadow:0 1px 2px rgba(0,0,0,.1); font-weight:600;}
+.seg button {border:0; background:transparent; padding:5px 11px; font-size:12.5px; border-radius:7px;
+             cursor:pointer; color:#4b5563;}
+.seg button.on {background:#fff; color:#111827; box-shadow:0 1px 2px rgba(0,0,0,.1); font-weight:500;}
 
 .group {display:inline-flex; gap:6px; flex-wrap:wrap; align-items:center;}
-.chip {border:1px solid #e5e7eb; background:#fff; border-radius:999px; padding:4px 10px; font-size:12px;
-       cursor:pointer; color:#374151; display:inline-flex; align-items:center; gap:5px; font-weight:500;}
+.chip {border:1px solid #e5e7eb; background:#fff; border-radius:999px; padding:4px 11px; font-size:12.5px;
+       cursor:pointer; color:#374151; display:inline-flex; align-items:center; gap:6px;}
 .chip:hover {border-color:#cbd0d8;}
-.chip.off {color:#9ca3af; background:#fafafa;}
+.chip.off {color:#a1a7b0; background:#fafafa;}
 .chip .d {width:8px; height:8px; border-radius:50%;}
 .chip.off .d {opacity:.25;}
 
-#vwrap {position:relative; width:100%; height:560px; background:#0b101b; overflow:hidden;}
+#vwrap {position:relative; width:100%; height:540px; background:#0b101b; overflow:hidden;}
 #vwrap.light {background:#ffffff;}
 #v {width:100%; height:100%; position:relative;}
 #gridCv {position:absolute; inset:0; width:100%; height:100%; pointer-events:none; z-index:4;}
 #ovLabs {position:absolute; inset:0; pointer-events:none; overflow:hidden; z-index:5;}
 
-.btag {position:absolute; left:0; top:0; font-size:12px; font-weight:700; color:#fff; padding:1px 6px;
-       border-radius:6px; white-space:nowrap; will-change:transform; box-shadow:0 1px 3px rgba(0,0,0,.3);}
+.btag {position:absolute; left:0; top:0; font-size:12px; font-weight:600; color:#fff; padding:1px 6px;
+       border-radius:6px; white-space:nowrap; will-change:transform;}
 
-.hud {position:absolute; left:12px; top:12px; z-index:6; padding:7px 11px; border-radius:10px; font-size:12px;
-      background:rgba(15, 23, 42, 0.78); color:#f8fafc; backdrop-filter:blur(6px);
-      border:1px solid rgba(255,255,255,.12); pointer-events:none; line-height:1.45;}
-#vwrap.light .hud {background:rgba(255,255,255,.9); color:#111827; border-color:#e5e7eb;}
+.hud {position:absolute; left:12px; top:12px; z-index:6; padding:6px 10px; border-radius:8px; font-size:12px;
+      background:rgba(15, 23, 42, 0.72); color:#e5e7eb; font-variant-numeric:tabular-nums;
+      border:1px solid rgba(255,255,255,.1); pointer-events:none;}
+#vwrap.light .hud {background:rgba(255,255,255,.88); color:#374151; border-color:#e5e7eb;}
 
-.anim {padding:12px 14px; border-top:1px solid #f1f2f4; background:#fafbfc;}
+.anim {padding:12px; border-top:1px solid #f1f2f4; background:#fafbfc;}
 .anim-row {display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
-.play {border:0; background:#111827; color:#fff; border-radius:9px; padding:6px 16px; font-size:13px;
-       font-weight:600; cursor:pointer; min-width:76px;}
+.play {border:0; background:#111827; color:#fff; border-radius:9px; padding:6px 14px; font-size:13px;
+       font-weight:500; cursor:pointer; min-width:72px;}
 .anim input[type=range] {flex:1; min-width:130px; accent-color:#111827; cursor:pointer;}
-.cap {font-size:12.5px; color:#374151; margin-top:8px; line-height:1.45;}
 
-.sec-title {font-size:11.5px; font-weight:700; color:#6b7280; text-transform:uppercase; letter-spacing:.04em; margin:0 0 8px 0;}
-
-/* Custom HTML Dropdown for Symmetry Ops */
-.dd {position:relative; width:100%; margin-bottom:10px;}
+/* Dropdown */
+.dd {position:relative; width:100%; margin:8px 0 14px 0;}
 .dd-btn {display:flex; width:100%; align-items:center; justify-content:space-between; gap:10px; font-size:13px;
-         padding:7px 11px; border:1px solid #d1d5db; border-radius:9px; background:#fff; color:#111827;
-         cursor:pointer; font-weight:500;}
-.dd-btn:hover {border-color:#9ca3af;}
+         padding:7px 11px; border:1px solid #e5e7eb; border-radius:9px; background:#fff; color:#111827;
+         cursor:pointer;}
+.dd-btn:hover {border-color:#cbd0d8;}
 .dd-menu {display:none; position:absolute; left:0; top:calc(100% + 4px); z-index:30; width:100%; max-height:260px;
           overflow:auto; background:#fff; border:1px solid #e5e7eb; border-radius:10px;
-          box-shadow:0 10px 25px rgba(16,24,40,.14); padding:4px;}
+          box-shadow:0 8px 24px rgba(16,24,40,.12); padding:4px;}
 .dd.open .dd-menu {display:block;}
-.dd-group {font-size:11px; color:#6b7280; font-weight:700; padding:7px 10px 3px; text-transform:uppercase;}
+.dd-group {font-size:11.5px; color:#6b7280; font-weight:600; padding:8px 10px 4px;}
 .dd-item {display:block; width:100%; text-align:left; border:0; background:none; padding:6px 10px; font-size:13px;
           border-radius:7px; cursor:pointer; color:#111827;}
 .dd-item:hover {background:#f3f4f6;}
-.dd-item.sel {background:#eef2ff; font-weight:600; color:#1d4ed8;}
+.dd-item.sel {background:#eef2ff; font-weight:500;}
 sub, sup {font-size:.72em; line-height:0;}
 .ss {display:inline-flex; flex-direction:column; vertical-align:middle; font-size:.7em; line-height:1; margin-left:1px;}
 .ss sup, .ss sub {font-size:1em; line-height:1; vertical-align:baseline;}
 
-/* 3x3 Matrix Bracket Editor */
-.mat-box {display:flex; align-items:center; justify-content:center; gap:5px; margin:4px 0 10px 0;}
-.bkt {width:8px; align-self:stretch; border:2px solid #111827;}
-.bkt.l {border-right:0; border-radius:4px 0 0 4px;}
-.bkt.r {border-left:0; border-radius:0 4px 4px 0;}
-.mgrid {display:grid; grid-template-columns:repeat(3, 74px); gap:5px 7px; padding:3px;}
-.mhdr {display:grid; grid-template-columns:repeat(3, 74px); gap:0 7px; text-align:center; font-size:11.5px; font-weight:700; margin-bottom:2px;}
+/* Matrix Bracket */
+.mat-box {display:flex; align-items:center; justify-content:center; gap:6px; margin:6px 0 12px 0;}
+.bkt {width:7px; align-self:stretch; border:1.8px solid #111827;}
+.bkt.l {border-right:0; border-radius:3px 0 0 3px;}
+.bkt.r {border-left:0; border-radius:0 3px 3px 0;}
+.mgrid {display:grid; grid-template-columns:repeat(3, 72px); gap:6px 8px; padding:3px;}
+.mhdr {display:grid; grid-template-columns:repeat(3, 72px); gap:0 8px; text-align:center; font-size:12px; font-weight:600; margin-bottom:2px;}
 
-.minp {width:100%; padding:5px 4px; font-size:13px; font-weight:600; text-align:center; border-radius:7px;
-       border:1.5px solid #e5e7eb; font-variant-numeric:tabular-nums; outline:none;}
+.minp {width:100%; padding:5px 4px; font-size:13.5px; font-weight:500; text-align:center; border-radius:8px;
+       border:1px solid #e5e7eb; font-variant-numeric:tabular-nums; outline:none; background:#fff; color:#111827;}
 .minp:focus {border-color:#2563eb;}
-.minp.ci {color:#15803d; border-color:#bbf7d0; background:#f0fdf4;}
-.minp.cj {color:#b91c1c; border-color:#fecaca; background:#fef2f2;}
-.minp.ck {color:#1d4ed8; border-color:#bfdbfe; background:#eff6ff;}
+.minp.ci {border-bottom:2px solid #16a34a;}
+.minp.cj {border-bottom:2px solid #dc2626;}
+.minp.ck {border-bottom:2px solid #2563eb;}
 
-.ci-txt {color:#16a34a; font-weight:700;}
-.cj-txt {color:#dc2626; font-weight:700;}
-.ck-txt {color:#2563eb; font-weight:700;}
-.cv-txt {color:#d97706; font-weight:700;}
+.ci-txt {color:#16a34a;}
+.cj-txt {color:#dc2626;}
+.ck-txt {color:#2563eb;}
+.cv-txt {color:#d97706;}
 
-.presets {display:flex; flex-wrap:wrap; gap:5px; margin-top:6px;}
-.pbtn {border:1px solid #e5e7eb; background:#f9fafb; border-radius:7px; padding:4px 8px; font-size:11.5px;
-       color:#374151; cursor:pointer; font-weight:500;}
-.pbtn:hover {background:#f3f4f6; border-color:#cbd0d8; color:#111827;}
+.presets {display:flex; flex-wrap:wrap; gap:6px; margin-top:8px;}
+.pbtn {border:1px solid #e5e7eb; background:#fff; border-radius:8px; padding:4px 10px; font-size:12px;
+       color:#374151; cursor:pointer;}
+.pbtn:hover {border-color:#cbd0d8; background:#f9fafb;}
 
-.stats {display:grid; grid-template-columns:1fr 1fr 1fr; gap:7px; margin-bottom:9px;}
-.stat {border:1px solid #eceef1; border-radius:9px; padding:8px 10px; background:#fafbfc;}
-.stat .k {font-size:11px; color:#6b7280; font-weight:500;}
-.stat .v {font-size:15.5px; font-weight:700; margin-top:2px; font-variant-numeric:tabular-nums;}
+.stats {display:grid; grid-template-columns:1fr 1fr 1fr; gap:8px; margin-top:10px;}
+.stat {border:1px solid #eceef1; border-radius:10px; padding:10px 12px; background:#fafbfc;}
+.stat .v {font-size:17px; font-weight:600; margin-top:2px; font-variant-numeric:tabular-nums;}
 
-.badge {display:inline-block; padding:3px 9px; border-radius:999px; font-size:11.5px; font-weight:600; margin-bottom:6px;}
-.badge.ok {background:#dcfce7; color:#166534;}
-.badge.warn {background:#fee2e2; color:#991b1b;}
-.badge.zero {background:#fef3c7; color:#92400e;}
-
-.eq-box {background:#f8fafc; border:1px solid #e5e7eb; border-radius:9px; padding:9px 11px;
-         font-size:12px; line-height:1.5; color:#1f2937; font-variant-numeric:tabular-nums;}
-select.small {font-size:12px; padding:4px 7px; border:1px solid #e5e7eb; border-radius:8px; background:#fff;}
+.vec-row {display:flex; align-items:center; justify-content:space-between; margin-bottom:8px;}
+select.small {font-size:12.5px; padding:4px 8px; border:1px solid #e5e7eb; border-radius:8px; background:#fff; color:#111827;}
+.vec-out {font-size:13px; color:#374151; font-variant-numeric:tabular-nums; line-height:1.6;
+          padding:8px 10px; background:#fafbfc; border:1px solid #eceef1; border-radius:10px;}
 </style>
 
 <div class="layout">
-  <!-- LEFT: 3Dmol + 3Blue1Brown Warping 3D Coordinate Space -->
+  <!-- LEFT: 3D Viewer -->
   <div>
-    <div class="card">
+    <div class="card" style="margin-bottom:0;">
       <div class="bar">
         <div class="seg" id="styleSeg"></div>
         <div class="group">
-          <button class="chip" id="tGrid"><span class="d" style="background:#38bdf8"></span>3b1b Space Grid</button>
-          <button class="chip" id="tBgGrid"><span class="d" style="background:#94a3b8"></span>Base Grid</button>
-          <button class="chip" id="tCube"><span class="d" style="background:#22c55e"></span>Unit Cube (det)</button>
-          <button class="chip" id="tGhost"><span class="d" style="background:#9ca3af"></span>Ghost Molecule</button>
-          <button class="chip" id="tDark">Dark (3b1b)</button>
-          <button class="chip" id="tReset">Reset View</button>
+          <button class="chip" id="tGrid"><span class="d" style="background:#38bdf8"></span>Grid</button>
+          <button class="chip" id="tBgGrid"><span class="d" style="background:#94a3b8"></span>Base grid</button>
+          <button class="chip" id="tCube"><span class="d" style="background:#22c55e"></span>Unit cube</button>
+          <button class="chip" id="tGhost"><span class="d" style="background:#9ca3af"></span>Start positions</button>
+          <button class="chip" id="tDark">Dark</button>
+          <button class="chip" id="tReset">Reset view</button>
         </div>
       </div>
 
@@ -540,33 +633,39 @@ select.small {font-size:12px; padding:4px 7px; border:1px solid #e5e7eb; border-
       <div class="anim">
         <div class="anim-row">
           <button class="play" id="playBtn">Pause</button>
-          <input type="range" id="scrub" min="0" max="1000" value="0" aria-label="Transformation progress">
-          <div class="seg" id="interpSeg" title="How space interpolates from I to M">
-            <button id="mLin" class="on">Linear (1−t)I + tM</button>
-            <button id="mGeod">Rigid Path</button>
+          <input type="range" id="scrub" min="0" max="1000" value="0" aria-label="Progress">
+          <div class="seg">
+            <button id="mLin" class="on">Linear</button>
+            <button id="mGeod">Rigid</button>
           </div>
           <button class="chip" id="tLoop">Loop</button>
         </div>
-        <div class="cap" id="capTxt"></div>
       </div>
     </div>
   </div>
 
-  <!-- RIGHT: Symmetry Operations vs. General 3Blue1Brown Matrix Editor -->
+  <!-- RIGHT: Controls -->
   <div>
     <div class="card pad">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-        <p class="sec-title" style="margin:0">1. Symmetry Matrices of <span id="molTitle"></span></p>
-        <span style="font-size:12px; font-weight:700; color:#111827;" id="pgBadge"></span>
+      <div class="pg-row">
+        <div>
+          <p class="cap">Point group</p>
+          <p class="pg-symbol" id="pgSym"></p>
+        </div>
+        <span class="pg-order" id="pgOrd"></span>
       </div>
+    </div>
+
+    <div class="card pad">
+      <p class="cap">Symmetry operation</p>
       <div class="dd" id="symDD"></div>
 
-      <p class="sec-title" style="margin-top:8px; margin-bottom:4px;">2. Or Apply Any 3Blue1Brown 3×3 Matrix M</p>
+      <p class="cap" style="margin-bottom:6px;">Transformation matrix M</p>
       <div style="display:flex; flex-direction:column; align-items:center;">
         <div class="mhdr">
-          <span class="ci-txt">î (col 1)</span>
-          <span class="cj-txt">ĵ (col 2)</span>
-          <span class="ck-txt">k̂ (col 3)</span>
+          <span class="ci-txt">î</span>
+          <span class="cj-txt">ĵ</span>
+          <span class="ck-txt">k̂</span>
         </div>
         <div class="mat-box">
           <div class="bkt l"></div>
@@ -575,36 +674,22 @@ select.small {font-size:12px; padding:4px 7px; border:1px solid #e5e7eb; border-
         </div>
       </div>
 
-      <p class="sec-title" style="margin-top:4px; margin-bottom:4px;">3b1b Linear Algebra Presets (Non-Symmetry Warps)</p>
+      <p class="cap">Presets</p>
       <div class="presets" id="presetBox"></div>
-    </div>
 
-    <div class="card pad">
-      <p class="sec-title">Live Space & Symmetry Verification</p>
       <div class="stats">
-        <div class="stat">
-          <div class="k">Target det(M)</div>
-          <div class="v" id="detTarget">1.00</div>
-        </div>
-        <div class="stat">
-          <div class="k">Live det M(t)</div>
-          <div class="v" id="detLive">1.00</div>
-        </div>
-        <div class="stat">
-          <div class="k">Symmetry RMSD</div>
-          <div class="v" id="rmsdVal">0.00 Å</div>
-        </div>
+        <div class="stat"><p class="cap">det(M)</p><div class="v" id="detTarget">1.00</div></div>
+        <div class="stat"><p class="cap">det M(t)</p><div class="v" id="detLive">1.00</div></div>
+        <div class="stat"><p class="cap">RMSD</p><div class="v" id="rmsdVal">0.00 Å</div></div>
       </div>
-      <div id="symVerdict"></div>
-      <div class="eq-box" id="liveMatBox"></div>
     </div>
 
     <div class="card pad">
-      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px;">
-        <p class="sec-title" style="margin:0">Track Atom Vector <span class="cv-txt">r⃗ = xî + yĵ + zk̂</span></p>
+      <div class="vec-row">
+        <p class="cap">Atom vector</p>
         <select id="atomSel" class="small"></select>
       </div>
-      <div class="eq-box" id="atomEqBox"></div>
+      <div class="vec-out" id="atomEqBox"></div>
     </div>
   </div>
 </div>
@@ -613,26 +698,21 @@ select.small {font-size:12px; padding:4px 7px; border:1px solid #e5e7eb; border-
 const D = __DATA__;
 const $ = id => document.getElementById(id);
 
-$("molTitle").textContent = D.name;
-$("pgBadge").innerHTML = `${D.pg} (h = ${D.orderStr})`;
+$("pgSym").innerHTML = D.pg;
+$("pgOrd").textContent = `h = ${D.orderStr}`;
 
 const STYLES = {
-  "Ball & stick": {stick: {radius: 0.13}, sphere: {scale: 0.24}},
-  "Sticks": {stick: {radius: 0.17}},
-  "Spacefill": {sphere: {scale: 0.85}}
+  "Ball & stick": {stick: {radius: 0.14}, sphere: {scale: 0.25}},
+  "Sticks": {stick: {radius: 0.18}},
+  "Spacefill": {sphere: {scale: 0.9}}
 };
 
-const PRESETS_3B1B = [
-  {name: "3b1b Shear (1:01 style)", M: [[1, 0.85, 0], [0.45, 1, 0], [0, 0, 1]],
-   desc: "3Blue1Brown Shear: grid lines stay parallel and evenly spaced, skewing the molecule off its ghost atoms!"},
-  {name: "Stretch Z (1.6×)", M: [[1, 0, 0], [0, 1, 0], [0, 0, 1.6]],
-   desc: "Anisotropic scaling along k̂: stretches the molecule vertically (det = 1.60), changing bond lengths."},
-  {name: "Collapse to XY Plane (det=0)", M: [[1, 0, 0], [0, 1, 0], [0, 0, 0]],
-   desc: "Singular Matrix (det = 0): squishes all of 3D space and the 3D molecule flat onto the z = 0 plane!"},
-  {name: "Collapse to Line (Rank 1)", M: [[1, 0.5, 0.5], [0.5, 0.25, 0.25], [0.5, 0.25, 0.25]],
-   desc: "Rank-1 Matrix (det = 0): collapses the entire 3D grid and every atom onto a single 1D line!"},
-  {name: "Identity I", M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
-   desc: "Identity matrix I: basis vectors stay at î=[1,0,0], ĵ=[0,1,0], k̂=[0,0,1]."}
+const PRESETS = [
+  {name: "Identity", M: [[1, 0, 0], [0, 1, 0], [0, 0, 1]]},
+  {name: "Shear XY", M: [[1, 0.85, 0], [0.45, 1, 0], [0, 0, 1]]},
+  {name: "Scale Z", M: [[1, 0, 0], [0, 1, 0], [0, 0, 1.6]]},
+  {name: "Project XY (det = 0)", M: [[1, 0, 0], [0, 1, 0], [0, 0, 0]]},
+  {name: "Rank 1 (det = 0)", M: [[1, 0.5, 0.5], [0.5, 0.25, 0.25], [0.5, 0.25, 0.25]]}
 ];
 
 const hasSymOps = D.symOps.length > 0;
@@ -645,8 +725,7 @@ const S = {
   showGhost: true,
   linearInterp: true,
   symIdx: hasSymOps ? 0 : -1,
-  M: hasSymOps ? D.symOps[0].R.map(r => [...r]) : PRESETS_3B1B[0].M.map(r => [...r]),
-  customDesc: hasSymOps ? "" : PRESETS_3B1B[0].desc,
+  M: hasSymOps ? D.symOps[0].R.map(r => [...r]) : PRESETS[1].M.map(r => [...r]),
   atomIdx: 0,
   t: 0,
   playing: true,
@@ -660,11 +739,11 @@ const P0 = D.atoms.map(a => a.p);
 const ghost = v.addModel(D.xyz, "xyz");
 
 function updateGhostStyle() {
-  const g = {color: S.dark ? "#64748b" : "#94a3b8", opacity: 0.28};
+  const g = {color: S.dark ? "#64748b" : "#9ca3af", opacity: 0.28};
   if (!S.showGhost) { ghost.setStyle({}, {}); return; }
-  if (S.style === "Spacefill") ghost.setStyle({}, {sphere: {...g, scale: 0.86}});
-  else if (S.style === "Sticks") ghost.setStyle({}, {stick: {...g, radius: 0.14}});
-  else ghost.setStyle({}, {sphere: {...g, scale: 0.22}, stick: {...g, radius: 0.09}});
+  if (S.style === "Spacefill") ghost.setStyle({}, {sphere: {...g, scale: 0.92}});
+  else if (S.style === "Sticks") ghost.setStyle({}, {sphere: {...g, radius: 0.24}});
+  else ghost.setStyle({}, {sphere: {...g, scale: 0.3}});
 }
 
 const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
@@ -957,13 +1036,13 @@ function fullRedraw() {
 
 function buildSymDropdown() {
   const root = $("symDD");
-  root.innerHTML = '<button type="button" class="dd-btn"><span class="dd-val"></span><span>▾</span></button><div class="dd-menu"></div>';
+  root.innerHTML = '<button type="button" class="dd-btn"><span class="dd-val"></span><span style="color:#9ca3af;font-size:11px">▾</span></button><div class="dd-menu"></div>';
   const btn = root.querySelector(".dd-btn"), menu = root.querySelector(".dd-menu"), valSpan = root.querySelector(".dd-val");
 
   if (!hasSymOps) {
     const h = document.createElement("div");
     h.className = "dd-group";
-    h.textContent = "Only E (C1 molecule — use 3b1b presets below)";
+    h.textContent = "Only E";
     menu.appendChild(h);
   } else {
     const groups = {};
@@ -984,7 +1063,6 @@ function buildSymDropdown() {
           root.classList.remove("open");
           S.symIdx = it.idx;
           S.M = D.symOps[it.idx].R.map(r => [...r]);
-          S.customDesc = "";
           syncMatrixInputs();
           S.t = 0; S.playing = true;
           startAnim();
@@ -1001,11 +1079,9 @@ function buildSymDropdown() {
   return {
     refresh() {
       if (S.symIdx >= 0 && D.symOps[S.symIdx]) {
-        valSpan.innerHTML = `Symmetry Op: <b>${D.symOps[S.symIdx].name}</b>`;
-      } else if (!hasSymOps) {
-        valSpan.innerHTML = `<i>No non-trivial symmetry ops (C₁) — using 3×3 Matrix</i>`;
+        valSpan.innerHTML = D.symOps[S.symIdx].name;
       } else {
-        valSpan.innerHTML = `<i>Custom / Non-Symmetry 3×3 Matrix M</i>`;
+        valSpan.innerHTML = "Custom matrix";
       }
       menu.querySelectorAll(".dd-item").forEach(b => {
         b.classList.toggle("sel", Number(b.dataset.idx) === S.symIdx);
@@ -1029,7 +1105,6 @@ function buildMatrixEditor() {
         if (!isNaN(val)) {
           S.M[r][c] = val;
           S.symIdx = -1;
-          S.customDesc = "Custom 3×3 matrix transformation: watch how the 3D coordinate grid and molecule warp together.";
           updateAtoms();
           updateUI();
         }
@@ -1039,14 +1114,13 @@ function buildMatrixEditor() {
   }
 
   const pBox = $("presetBox");
-  PRESETS_3B1B.forEach(p => {
+  PRESETS.forEach(p => {
     const b = document.createElement("button");
     b.className = "pbtn";
     b.textContent = p.name;
     b.onclick = () => {
       S.M = p.M.map(r => [...r]);
       S.symIdx = -1;
-      S.customDesc = p.desc;
       syncMatrixInputs();
       S.t = 0; S.playing = true;
       startAnim();
@@ -1060,7 +1134,7 @@ function buildMatrixEditor() {
   D.atoms.forEach((a, i) => {
     const opt = document.createElement("option");
     opt.value = String(i);
-    opt.textContent = `${a.lab} (${a.p[0].toFixed(2)}, ${a.p[1].toFixed(2)}, ${a.p[2].toFixed(2)})`;
+    opt.textContent = a.lab;
     aSel.appendChild(opt);
   });
   aSel.value = "0";
@@ -1082,7 +1156,7 @@ function updateUI() {
   $("tBgGrid").classList.toggle("off", !S.showBgGrid);
   $("tCube").classList.toggle("off", !S.showCube);
   $("tGhost").classList.toggle("off", !S.showGhost);
-  $("tDark").textContent = S.dark ? "Dark (3b1b)" : "Light";
+  $("tDark").textContent = S.dark ? "Dark" : "Light";
   $("mLin").classList.toggle("on", S.linearInterp);
   $("mGeod").classList.toggle("on", !S.linearInterp);
   $("tLoop").classList.toggle("off", !S.loop);
@@ -1100,43 +1174,20 @@ function updateUI() {
   $("detLive").textContent = dtLive.toFixed(2);
   $("rmsdVal").textContent = `${rmsd.toFixed(2)} Å`;
 
-  const isSym = rmsd < 0.08 && Math.abs(Math.abs(dtTarget) - 1.0) < 0.05;
-  if (Math.abs(dtTarget) < 0.04) {
-    $("symVerdict").innerHTML = `<span class="badge zero">Singular Matrix (det = 0): Space collapses into lower dimension!</span>`;
-  } else if (isSym) {
-    $("symVerdict").innerHTML = `<span class="badge ok">✓ True Symmetry Matrix of ${D.name}: Grid warps & atoms land on identical atoms!</span>`;
-  } else {
-    $("symVerdict").innerHTML = `<span class="badge warn">✗ Non-Symmetry Matrix: Space warps/stretches the molecule off its ghost (RMSD = ${rmsd.toFixed(2)} Å)</span>`;
-  }
-
   $("hudBox").innerHTML =
-    `<b>Live Basis Columns of M(t) (t = ${S.t.toFixed(2)}):</b><br>` +
-    `<span style="color:#4ade80">î(t) = [${Mt[0][0].toFixed(2)}, ${Mt[1][0].toFixed(2)}, ${Mt[2][0].toFixed(2)}]</span> &nbsp;|&nbsp; ` +
-    `<span style="color:#f87171">ĵ(t) = [${Mt[0][1].toFixed(2)}, ${Mt[1][1].toFixed(2)}, ${Mt[2][1].toFixed(2)}]</span> &nbsp;|&nbsp; ` +
-    `<span style="color:#60a5fa">k̂(t) = [${Mt[0][2].toFixed(2)}, ${Mt[1][2].toFixed(2)}, ${Mt[2][2].toFixed(2)}]</span>`;
-
-  $("liveMatBox").innerHTML =
-    `<b>How the 3Blue1Brown Grid Warps:</b><br>` +
-    (S.linearInterp
-      ? `Using pure linear interpolation <b>M(t) = (1 − t)I + tM</b>. Notice how for reflections or inversions, the grid lines pass straight through one another (det M(t) crosses 0) as space turns inside-out!`
-      : `Using rigid rotation/reflection path. Switch to <b>Linear (1−t)I + tM</b> on the bottom bar to see the pure 3Blue1Brown linear grid morph!`);
-
-  if (S.symIdx >= 0 && D.symOps[S.symIdx]) {
-    $("capTxt").innerHTML = D.symOps[S.symIdx].desc;
-  } else {
-    $("capTxt").innerHTML = S.customDesc;
-  }
+    `<span style="color:#4ade80">î [${Mt[0][0].toFixed(2)}, ${Mt[1][0].toFixed(2)}, ${Mt[2][0].toFixed(2)}]</span> &nbsp; ` +
+    `<span style="color:#f87171">ĵ [${Mt[0][1].toFixed(2)}, ${Mt[1][1].toFixed(2)}, ${Mt[2][1].toFixed(2)}]</span> &nbsp; ` +
+    `<span style="color:#60a5fa">k̂ [${Mt[0][2].toFixed(2)}, ${Mt[1][2].toFixed(2)}, ${Mt[2][2].toFixed(2)}]</span>`;
 
   if (S.atomIdx >= 0 && S.atomIdx < D.atoms.length) {
     const a = D.atoms[S.atomIdx];
     const [x, y, z] = a.p;
     const q = applyMat(Mt, a.p);
     $("atomEqBox").innerHTML =
-      `<b>M(t) · <span class="cv-txt">${a.lab}</span></b> = ` +
-      `(${x.toFixed(2)})<span class="ci-txt">î(t)</span> + (${y.toFixed(2)})<span class="cj-txt">ĵ(t)</span> + (${z.toFixed(2)})<span class="ck-txt">k̂(t)</span><br>` +
-      `Start: [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}] &nbsp;→&nbsp; <b class="cv-txt">Now: [${q[0].toFixed(2)}, ${q[1].toFixed(2)}, ${q[2].toFixed(2)}]</b>`;
+      `r(0) = [${x.toFixed(2)}, ${y.toFixed(2)}, ${z.toFixed(2)}]<br>` +
+      `r(t) = <span class="cv-txt">[${q[0].toFixed(2)}, ${q[1].toFixed(2)}, ${q[2].toFixed(2)}]</span>`;
   } else {
-    $("atomEqBox").innerHTML = "Select an atom above to see its tip-to-tail linear combination xî(t) + yĵ(t) + zk̂(t).";
+    $("atomEqBox").innerHTML = "Off";
   }
 }
 
@@ -1177,7 +1228,7 @@ function tick(ts) {
   if (lastTs === null) lastTs = ts;
   const dt = Math.min((ts - lastTs) / 1000, 0.1);
   lastTs = ts;
-  const dur = 2.5;
+  const dur = 2.4;
 
   if (hold > 0) {
     hold -= dt;
@@ -1187,7 +1238,7 @@ function tick(ts) {
     }
   } else {
     S.t = Math.min(1, S.t + dt / dur);
-    if (S.t >= 1) hold = 1.1;
+    if (S.t >= 1) hold = 1.0;
   }
   updateAtoms();
   updateUI();
@@ -1202,61 +1253,66 @@ startAnim();
 </script>
 """
     html = html.replace("__DATA__", json.dumps(data))
-    components.html(html, height=730, scrolling=False)
+    components.html(html, height=690, scrolling=False)
 
 
-# Header matching your symmetry app
+# Header
 st.markdown("""
 <div class="ui top">
-  <p class="title">Molecular Space & Matrix Visualizer</p>
-  <p class="subtitle">Upload any .xyz file to visualize its symmetry matrices and 3Blue1Brown 3×3 linear transformations in 3D coordinate space.</p>
+  <p class="title">Matrix transformation</p>
+  <p class="subtitle">Upload an .xyz file to apply symmetry operations and 3×3 linear transformations in 3D space.</p>
 </div>
 """, unsafe_allow_html=True)
 
-# File uploader on the left, tolerance on the right
 c1, c2 = st.columns([3, 1.3], gap="large")
 with c1:
     up = st.file_uploader("XYZ file", type=["xyz"], label_visibility="collapsed")
 with c2:
     tol = st.slider(
         "Tolerance (Å)", 0.05, 1.0, 0.3, 0.05,
-        help="How far atoms can be off and still count as symmetric. "
-             "Raise it if a symmetric molecule comes out as C1."
+        help="How far atoms can be off and still count as symmetric."
     )
 
-# Empty state until user drops an .xyz file
 if up is None:
     st.markdown("""
 <div class="ui empty"><b>No molecule yet</b><br>Drop an .xyz file above to get started.</div>
 """, unsafe_allow_html=True)
     st.stop()
 
-try:
-    mol = Molecule.from_str(up.getvalue().decode("utf-8", errors="ignore"), fmt="xyz")
-    mol_name = up.name.rsplit(".", 1)[0]
-except Exception as e:
-    st.error(
-        f"Couldn't read {up.name}. Check the file is a normal xyz "
-        f"(atom count, comment line, then element x y z). Error: {e}"
-    )
-    st.stop()
+raw_xyz = up.getvalue().decode("utf-8", errors="ignore")
 
-with st.spinner("Finding symmetry matrices..."):
-    try:
-        pga = PointGroupAnalyzer(mol, tolerance=tol, eigen_tolerance=max(0.01, tol * 0.08))
-    except TypeError:
-        pga = PointGroupAnalyzer(mol, tolerance=tol)
-    pg = pga.sch_symbol
-    cmol = pga.centered_mol
+with st.spinner("Finding symmetry..."):
+    if HAS_PMG:
+        try:
+            mol = Molecule.from_str(raw_xyz, fmt="xyz")
+        except Exception as e:
+            st.error(f"Couldn't read {up.name}. Error: {e}")
+            st.stop()
+        try:
+            pga = PointGroupAnalyzer(mol, tolerance=tol, eigen_tolerance=max(0.01, tol * 0.08))
+        except TypeError:
+            pga = PointGroupAnalyzer(mol, tolerance=tol)
+        pg = pga.sch_symbol
+        cmol = pga.centered_mol
+        coords = cmol.cart_coords
+        species = [str(s.specie) for s in cmol]
+        centered_xyz = cmol.to(fmt="xyz")
+        matrices = [] if "*" in pg else clean_ops(pga.get_symmetry_operations())
+    else:
+        try:
+            species, coords, centered_xyz = parse_xyz_fallback(raw_xyz)
+        except Exception as e:
+            st.error(f"Couldn't read {up.name}. Error: {e}")
+            st.stop()
+        pg, matrices = fallback_symmetry(species, coords, tol)
 
     if "*" in pg:
-        sym_ops = build_linear_sym_ops(pg, cmol.cart_coords)
+        sym_ops = build_linear_sym_ops(pg, coords)
         order_str = "∞"
     else:
-        matrices = clean_ops(pga.get_symmetry_operations())
-        axes = get_axes(matrices, pg, cmol.cart_coords, tol)
+        axes = get_axes(matrices, pg, coords, tol)
         normals = get_planes(matrices)
-        types = label_planes(normals, pg, axes, cmol.cart_coords, tol)
+        types = label_planes(normals, pg, axes, coords, tol)
         order = sorted(range(len(types)), key=lambda i: PLANE_ORDER.index(types[i]))
         planes, seen = [], Counter()
         for i in order:
@@ -1267,4 +1323,4 @@ with st.spinner("Finding symmetry matrices..."):
         sym_ops = build_sym_ops(matrices, axes, planes)
         order_str = str(len(matrices))
 
-render_app(cmol, pg, sym_ops, mol_name, order_str)
+render_app(centered_xyz, coords, species, pg, sym_ops, order_str)
